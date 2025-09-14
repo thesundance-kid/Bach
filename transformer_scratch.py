@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
+import pretty_midi as pm
 
 # -------------------------
 # Data / Dataset
@@ -164,7 +165,82 @@ def train(jsonl, vocab_pkl, out_dir="ckpts", seq_len=256, batch=8, epochs=5, lr=
         print(f"Epoch {ep}: loss={np.mean(losses):.4f}")
         torch.save(model.state_dict(), os.path.join(out_dir, f"tiny_ep{ep}.pt"))
 
-def sample(jsonl, vocab_pkl, ckpt, max_new_tokens=128, temperature=1.0, top_k=0):
+def events_to_midi(tokens: list[str],
+                   out_path: str,
+                   qpm: float = 120.0,
+                   steps_per_beat: int = 4,
+                   program: int = 0,
+                   sustain_tail_sec: float = 0.05):
+    """
+    Convert event tokens back to a single-track MIDI.
+    Tokens supported: NOTE_ON=*, NOTE_OFF=*, VEL=*, TSHIFT=*
+    Timing: each TSHIFT increases time by (60/qpm)/steps_per_beat seconds.
+    """
+    m = pm.PrettyMIDI()
+    inst = pm.Instrument(program=program)
+    m.instruments.append(inst)
+
+    sec_per_step = (60.0 / qpm) / steps_per_beat
+    t = 0.0
+    current_vel_bucket = 20  # default bucket; will be mapped to MIDI 1..127
+    active: dict[int, tuple[float, int]] = {}  # pitch -> (start_time, velocity)
+
+    def bucket_to_velocity(b: int) -> int:
+        # Map 0..31 -> 1..127 (center of bin-ish)
+        # Inverse of the tokenizer's np.interp – any smooth mapping is fine.
+        b = max(0, min(31, b))
+        # Spread 32 buckets across 127 levels:
+        lo, hi = 1, 127
+        return int(round(lo + (hi - lo) * (b + 0.5) / 32.0))
+
+    for tok in tokens:
+        if tok.startswith("TSHIFT="):
+            try:
+                steps = int(tok.split("=")[1])
+            except Exception:
+                steps = 0
+            t += steps * sec_per_step
+
+        elif tok.startswith("VEL="):
+            try:
+                current_vel_bucket = int(tok.split("=")[1])
+            except Exception:
+                current_vel_bucket = 20
+
+        elif tok.startswith("NOTE_ON="):
+            try:
+                pitch = int(tok.split("=")[1])
+            except Exception:
+                continue
+            if pitch not in active:
+                vel = bucket_to_velocity(current_vel_bucket)
+                active[pitch] = (t, vel)
+
+        elif tok.startswith("NOTE_OFF="):
+            try:
+                pitch = int(tok.split("=")[1])
+            except Exception:
+                continue
+            if pitch in active:
+                start, vel = active.pop(pitch)
+                end = max(t, start + 1e-4)  # ensure positive duration
+                inst.notes.append(pm.Note(velocity=vel, pitch=pitch, start=start, end=end))
+
+        # ignore meta like [BOS], [EOS], [SECTION], SEC=*, KEY/TEMPO if present
+
+    # Close any hanging notes with a small tail
+    if active:
+        final_end = t + sustain_tail_sec
+        for pitch, (start, vel) in list(active.items()):
+            end = max(final_end, start + 1e-4)
+            inst.notes.append(pm.Note(velocity=vel, pitch=pitch, start=start, end=end))
+        active.clear()
+
+    m.write(out_path)
+
+
+def sample(jsonl, vocab_pkl, ckpt, max_new_tokens=128, temperature=1.0, top_k=0,
+           write_midi: str | None = None, qpm: float = 120.0, steps_per_beat: int = 4):
     with open(vocab_pkl, "rb") as f:
         obj = pickle.load(f)
         token_to_id = obj["token_to_id"]; id_to_token = obj["id_to_token"]
@@ -176,8 +252,8 @@ def sample(jsonl, vocab_pkl, ckpt, max_new_tokens=128, temperature=1.0, top_k=0)
 
     # seed from first example
     first_events = json.loads(open(jsonl).readline())["events"]
-    ctx = [token_to_id[t] for t in first_events[:64] if t in token_to_id]  # small prefix
-    x = torch.tensor(ctx, dtype=torch.long, device=device).unsqueeze(0)    # [1, T]
+    ctx = [token_to_id[t] for t in first_events[:64] if t in token_to_id]
+    x = torch.tensor(ctx, dtype=torch.long, device=device).unsqueeze(0)  # [1, T]
 
     @torch.no_grad()
     def decode_step(x):
@@ -197,8 +273,15 @@ def sample(jsonl, vocab_pkl, ckpt, max_new_tokens=128, temperature=1.0, top_k=0)
 
     out_ids = x[0].tolist()
     out_tokens = [id_to_token[i] for i in out_ids]
+
     print("\n--- SAMPLE TOKENS ---")
-    print(" ".join(out_tokens[-200:]))  # print tail
+    print(" ".join(out_tokens[-200:]))
+
+    if write_midi:
+        # Convert token stream to MIDI and save
+        events_to_midi(out_tokens, write_midi, qpm=qpm, steps_per_beat=steps_per_beat)
+        print(f"\nWrote generated MIDI to: {write_midi}")
+
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
@@ -221,10 +304,15 @@ if __name__ == "__main__":
     ap.add_argument("--max_new_tokens", type=int, default=128)
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--top_k", type=int, default=0)
+    ap.add_argument("--write_midi", type=str, default=None, help="If set, write sampled tokens to this MIDI path")
+    ap.add_argument("--qpm", type=float, default=120.0, help="Tempo for events->MIDI conversion")
+    ap.add_argument("--steps_per_beat", type=int, default=4, help="TSHIFT granularity (4=16th notes)")
+
     args = ap.parse_args()
 
     if args.mode == "train":
         train(args.jsonl, args.vocab, args.out_dir, args.seq_len, args.batch, args.epochs,
               args.lr, args.d_model, args.n_layers, args.n_heads, args.d_ff, args.dropout)
     else:
-        sample(args.jsonl, args.vocab, args.ckpt, args.max_new_tokens, args.temperature, args.top_k)
+        sample(args.jsonl, args.vocab, args.ckpt, args.max_new_tokens, args.temperature, args.top_k,
+           write_midi=args.write_midi, qpm=args.qpm, steps_per_beat=args.steps_per_beat)
