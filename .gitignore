@@ -1,0 +1,28 @@
+cat > .gitignore <<'GI'
+# ignore data and outputs
+data/
+outputs/
+*.csv
+*.mid
+*.wav
+checkpoints/
+ckpts/
+training_data/
+archive/
+
+# Pretrained/vendor code if you don't want to track it
+music_transformer_parts/
+
+# python cache
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# envs
+.venv/
+env/
+.vscode/
+GI
+
+# macOS junk
+.DS_Store
